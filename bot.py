@@ -11,6 +11,10 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters
 )
+from fetchers.web import jina_fetch
+from fetchers.youtube import fetch_youtube
+from fetchers.pdf import fetch_pdf
+from youtube_transcript_api import NoTranscriptFound
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -28,8 +32,7 @@ AI_MODEL      = os.environ.get("AI_MODEL", "deepseek-chat")
 AI_BASE_URL   = os.environ.get("AI_BASE_URL", "https://api.deepseek.com")
 AI_MAX_TOKENS = int(os.environ.get("AI_MAX_TOKENS", "1200"))
 
-JINA_KEY       = os.environ.get("JINA_KEY", "")
-JINA_MAX_CHARS = int(os.environ.get("JINA_MAX_CHARS", "8000"))
+_YT_PATTERN = re.compile(r"youtube\.com|youtu\.be")
 
 # ── Prompts ───────────────────────────────────────────────
 SYSTEM_PROMPT_CARD = """你是一个帮助用户快速判断文章价值的阅读助手。
@@ -67,29 +70,6 @@ def is_allowed(user_id: int) -> bool:
     if not ALLOWED_USERS:
         return True
     return str(user_id) in ALLOWED_USERS
-
-
-async def jina_fetch(url: str) -> tuple[str, str]:
-    jina_url = f"https://r.jina.ai/{url}"
-    headers = {"Accept": "text/plain", "X-Return-Format": "markdown"}
-    if JINA_KEY:
-        headers["Authorization"] = f"Bearer {JINA_KEY}"
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(jina_url, headers=headers, follow_redirects=True)
-        resp.raise_for_status()
-        text = resp.text
-
-    if len(text) < 100:
-        raise ValueError("提取内容过短，页面可能有访问限制")
-
-    m = re.search(r"^#\s+(.+)", text, re.MULTILINE)
-    title = m.group(1).strip() if m else url.split("/")[-1][:60]
-
-    if len(text) > JINA_MAX_CHARS:
-        text = text[:JINA_MAX_CHARS] + "\n\n[正文已截断]"
-
-    return title, text
 
 
 async def ai_call(system: str, user_msg: str) -> tuple[dict, dict]:
@@ -326,8 +306,20 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("⏳ 正在提取全文…")
 
     try:
-        await msg.edit_text("⏳ 正在提取全文…（Jina Reader）")
-        title, full_text = await jina_fetch(url)
+        if _YT_PATTERN.search(url):
+            await msg.edit_text("⏳ 正在提取字幕…（YouTube）")
+            try:
+                title, full_text = await fetch_youtube(url)
+            except NoTranscriptFound:
+                await msg.edit_text(
+                    f"⚠️ 该视频无可用字幕，无法分析\n🔗 [原链接]({url})",
+                    parse_mode="Markdown",
+                    disable_web_page_preview=True,
+                )
+                return
+        else:
+            await msg.edit_text("⏳ 正在提取全文…（Jina Reader）")
+            title, full_text = await jina_fetch(url)
 
         await msg.edit_text(f"🤖 正在分析…（{AI_MODEL}）")
         user_msg = f"标题：{title}\n链接：{url}\n\n{full_text}"
@@ -360,6 +352,53 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(f"❌ 抓取失败：HTTP {e.response.status_code}，页面可能需要登录")
     except Exception as e:
         log.exception("处理出错")
+        await msg.edit_text(f"❌ 出错：{e}")
+
+
+async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+
+    doc = update.message.document
+    filename = doc.file_name or "document.pdf"
+    msg = await update.message.reply_text("⏳ 正在读取 PDF…")
+
+    try:
+        tg_file = await doc.get_file()
+        file_bytes = await tg_file.download_as_bytearray()
+        title, full_text = fetch_pdf(bytes(file_bytes), filename)
+
+        await msg.edit_text(f"🤖 正在分析…（{AI_MODEL}）")
+        user_msg = f"标题：{title}\n\n{full_text}"
+        result, usage = await ai_call(SYSTEM_PROMPT_CARD, user_msg)
+
+        key = str(update.message.message_id)
+        ctx.bot_data[key] = {
+            "result": result,
+            "url": filename,
+            "usage": usage,
+            "full_text": full_text,
+            "title": title,
+            "deep": None,
+            "deep_usage": None,
+        }
+
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔍 深度解析", callback_data=f"deep:{key}"),
+            InlineKeyboardButton("📥 导出 MD",  callback_data=f"md:{key}"),
+        ]])
+
+        await msg.edit_text(
+            fmt_card(result, filename, usage),
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+            disable_web_page_preview=True
+        )
+
+    except ValueError as e:
+        await msg.edit_text(f"❌ {e}")
+    except Exception as e:
+        log.exception("PDF 处理出错")
         await msg.edit_text(f"❌ 出错：{e}")
 
 
@@ -425,6 +464,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help",  cmd_help))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
+    app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     log.info(f"Distill Bot 启动 | {AI_PROVIDER} / {AI_MODEL}")
