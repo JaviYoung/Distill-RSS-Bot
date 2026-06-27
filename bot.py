@@ -31,6 +31,9 @@ AI_API_KEY    = os.environ["AI_API_KEY"]
 AI_MODEL      = os.environ.get("AI_MODEL", "deepseek-chat")
 AI_BASE_URL   = os.environ.get("AI_BASE_URL", "https://api.deepseek.com")
 AI_MAX_TOKENS = int(os.environ.get("AI_MAX_TOKENS", "1200"))
+ENABLE_DEBUG_COMMANDS = os.environ.get(
+    "ENABLE_DEBUG_COMMANDS", "false"
+).strip().lower() in {"1", "true", "yes", "on"}
 
 _YT_PATTERN = re.compile(r"youtube\.com|youtu\.be")
 
@@ -70,6 +73,40 @@ def is_allowed(user_id: int) -> bool:
     if not ALLOWED_USERS:
         return True
     return str(user_id) in ALLOWED_USERS
+
+
+def _youtube_error_message(exc: Exception) -> str:
+    name = type(exc).__name__
+    detail = str(exc).lower()
+
+    if isinstance(exc, NoTranscriptFound):
+        return "该视频没有可用字幕，无法分析"
+    if name == "TranscriptsDisabled" or "transcripts are disabled" in detail:
+        return "该视频已关闭字幕"
+    if name in {"VideoUnavailable", "InvalidVideoId"}:
+        return "视频不可用，可能已删除、设为私有或链接无效"
+    if name == "AgeRestricted":
+        return "视频有年龄限制，服务器无法直接获取字幕"
+    if name in {"RequestBlocked", "IpBlocked", "TooManyRequests"}:
+        return "YouTube 已限制测试服务器的请求，请稍后重试或更换网络"
+    if (
+        name in {"YouTubeRequestFailed", "ProxyError", "ConnectionError", "Timeout"}
+        or "429" in detail
+        or ("ip" in detail and "block" in detail)
+    ):
+        return "连接 YouTube 失败或请求受到限制，请查看服务器日志"
+    return f"字幕提取失败（{name}），请查看服务器日志"
+
+
+def _process_rss_kb() -> int | None:
+    try:
+        with open("/proc/self/status", encoding="utf-8") as status:
+            for line in status:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError):
+        pass
+    return None
 
 
 async def ai_call(system: str, user_msg: str) -> tuple[dict, dict]:
@@ -295,6 +332,43 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_debug_cache(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+
+    records = []
+    total_chars = 0
+    deep_count = 0
+
+    for key, data in ctx.bot_data.items():
+        if not isinstance(data, dict) or "full_text" not in data:
+            continue
+
+        chars = len(data.get("full_text", ""))
+        total_chars += chars
+        deep_count += bool(data.get("deep"))
+        title = str(data.get("title", "")).replace("\n", " ")[:60]
+        records.append((str(key), title, chars))
+
+    rss_kb = _process_rss_kb()
+    rss_text = f"{rss_kb / 1024:.1f} MiB" if rss_kb is not None else "不可用"
+    lines = [
+        f"缓存文章：{len(records)}",
+        f"原文字符：{total_chars}",
+        f"深度解析：{deep_count}",
+        f"进程内存：{rss_text}",
+    ]
+
+    if records:
+        lines.append("\n最近缓存：")
+        lines.extend(
+            f"{key}: {title or '(无标题)'} ({chars} chars)"
+            for key, title, chars in reversed(records[-20:])
+        )
+
+    await update.message.reply_text("\n".join(lines)[:4000])
+
+
 async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
@@ -310,10 +384,14 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text("⏳ 正在提取字幕…（YouTube）")
             try:
                 title, full_text = await fetch_youtube(url)
-            except NoTranscriptFound:
+            except Exception as e:
+                log.exception(
+                    "YouTube 字幕提取失败 | url=%s | error=%s",
+                    url,
+                    type(e).__name__,
+                )
                 await msg.edit_text(
-                    f"⚠️ 该视频无可用字幕，无法分析\n🔗 [原链接]({url})",
-                    parse_mode="Markdown",
+                    f"⚠️ {_youtube_error_message(e)}\n🔗 {url}",
                     disable_web_page_preview=True,
                 )
                 return
@@ -404,14 +482,22 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    if not is_allowed(query.from_user.id):
+        await query.answer("无权限执行该操作", show_alert=True)
+        return
 
-    action, key = query.data.split(":", 1)
+    try:
+        action, key = query.data.split(":", 1)
+    except (AttributeError, ValueError):
+        await query.answer("无效操作", show_alert=True)
+        return
+
     data = ctx.bot_data.get(key)
     if not data:
         await query.answer("数据已过期，请重新发送链接", show_alert=True)
         return
 
+    await query.answer()
     result   = data["result"]
     url      = data["url"]
     usage    = data["usage"]
@@ -463,6 +549,11 @@ def main():
     app = Application.builder().token(TG_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help",  cmd_help))
+    if ENABLE_DEBUG_COMMANDS and ALLOWED_USERS:
+        app.add_handler(CommandHandler("debug_cache", cmd_debug_cache))
+        log.info("调试命令已启用：/debug_cache")
+    elif ENABLE_DEBUG_COMMANDS:
+        log.warning("未配置 ALLOWED_USERS，/debug_cache 不会启用")
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
     app.add_handler(CallbackQueryHandler(handle_callback))

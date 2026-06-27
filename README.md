@@ -45,6 +45,7 @@ Send any article URL to your bot. That's it.
 |---------|-------------|
 | `/start` | Show welcome message |
 | `/help` | Show usage instructions |
+| `/debug_cache` | Show in-memory cache statistics when debug commands are enabled |
 | Send URL | Analyze article |
 | 🔍 Deep analysis | Trigger detailed analysis (extra AI call) |
 | 📥 Export MD | Download `.md` file (no extra token cost) |
@@ -53,6 +54,7 @@ Send any article URL to your bot. That's it.
 
 - WeChat public account articles (`mp.weixin.qq.com`) are not supported due to geo-restrictions on Jina's servers
 - Deep analysis result is cached per session; re-sending the same URL starts fresh after bot restart
+- Set `ENABLE_DEBUG_COMMANDS=true` with a non-empty `ALLOWED_USERS` to enable `/debug_cache`
 - All config is via environment variables; no code changes needed to switch providers
 
 ## Tech Stack

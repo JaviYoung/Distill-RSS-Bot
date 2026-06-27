@@ -35,14 +35,7 @@ async def _fetch_title(video_id: str) -> str:
 async def fetch_youtube(url: str) -> tuple[str, str]:
     video_id = _extract_video_id(url)
 
-    try:
-        transcript_list = _api.list(video_id)
-    except NoTranscriptFound:
-        raise
-    except Exception as e:
-        nfe = NoTranscriptFound.__new__(NoTranscriptFound)
-        Exception.__init__(nfe, "该视频无可用字幕")
-        raise nfe from e
+    transcript_list = _api.list(video_id)
 
     transcript = None
     last_exc: NoTranscriptFound | None = None

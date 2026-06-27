@@ -38,3 +38,4 @@ services:
       AI_MAX_TOKENS:  "1200"    # AI 回复最大 token 数
       JINA_MAX_CHARS: "8000"    # 正文截断字符数
       JINA_KEY: ""              # Jina API Key（留空用免费额度）
+      ENABLE_DEBUG_COMMANDS: "false"  # 测试机设为 true，启用 /debug_cache
